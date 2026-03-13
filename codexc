@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CODEXC_SELF_PATH="$0" exec python3 - "$@" <<'PY'
+import fcntl
+import errno
+import os
+import pathlib
+import re
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+BANNER = "Codex Continuer by https://github.com/EdamAme-x/codex-continuer"
+DEFAULT_CONTINUE_PROMPT = (
+    "Critically evaluate your most recent response, plan, and next action. "
+    "If the current direction is sound, continue executing it without asking me "
+    "for confirmation. If something looks weak, ambiguous, or suboptimal, "
+    "improve it slightly and then continue. Keep working until the task is "
+    "actually complete, and only stop if you are truly blocked by missing "
+    "external information or a hard constraint."
+)
+CONTROL_REPLY_RE = re.compile(br"^(?:\x1b\[[0-9;]*R)+$")
+
+
+def env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.lower() not in {"", "0", "false", "no", "off"}
+
+
+def parse_args(argv):
+    codex_args = []
+    extra_prompts = []
+    install = False
+    install_dir = None
+    idle_timeout_override = None
+    passthrough = False
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if passthrough:
+            codex_args.append(arg)
+            index += 1
+            continue
+        if arg == "--":
+            passthrough = True
+            codex_args.append(arg)
+            index += 1
+            continue
+        if arg == "--install":
+            install = True
+            index += 1
+            continue
+        if arg == "--idle-timeout":
+            if index + 1 >= len(argv):
+                print("codexc: --idle-timeout requires an argument", file=sys.stderr)
+                sys.exit(2)
+            idle_timeout_override = argv[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--idle-timeout="):
+            idle_timeout_override = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg == "--install-dir":
+            if index + 1 >= len(argv):
+                print("codexc: --install-dir requires an argument", file=sys.stderr)
+                sys.exit(2)
+            install_dir = argv[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--install-dir="):
+            install_dir = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg == "--with":
+            if index + 1 >= len(argv):
+                print("codexc: --with requires an argument", file=sys.stderr)
+                sys.exit(2)
+            extra_prompts.append(argv[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--with="):
+            extra_prompts.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        codex_args.append(arg)
+        index += 1
+    return codex_args, extra_prompts, install, install_dir, idle_timeout_override
+
+
+def build_continue_prompt(extra_prompts):
+    def collapse(text):
+        return " ".join(text.split())
+
+    base = collapse(os.environ.get("CODEXC_CONTINUE_PROMPT", DEFAULT_CONTINUE_PROMPT))
+    if not extra_prompts:
+        return base
+    joined = " ".join(collapse(prompt) for prompt in extra_prompts if collapse(prompt))
+    if not joined:
+        return base
+    return f"{base} Additional run-specific instruction: {joined}"
+
+
+def exec_passthrough(codex_bin, codex_args):
+    os.execvp(codex_bin, [codex_bin, *codex_args])
+
+
+def open_controlling_tty():
+    try:
+        return os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return None
+
+
+def path_entries():
+    return [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+
+
+def choose_install_dir(explicit_dir):
+    home = pathlib.Path.home()
+    preferred = []
+    if explicit_dir:
+        preferred.append(pathlib.Path(explicit_dir).expanduser())
+    preferred.extend([home / ".local" / "bin", home / "bin"])
+    path_dirs = [pathlib.Path(entry).expanduser() for entry in path_entries()]
+    for candidate in path_dirs:
+        if candidate not in preferred:
+            preferred.append(candidate)
+
+    for candidate in preferred:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if os.access(candidate, os.W_OK | os.X_OK):
+            return candidate
+    return None
+
+
+def install_self(explicit_dir):
+    source_hint = os.environ.get("CODEXC_SELF_PATH") or sys.argv[0]
+    source = pathlib.Path(os.path.realpath(source_hint))
+    target_dir = choose_install_dir(explicit_dir)
+    if target_dir is None:
+        print("codexc: could not find a writable install directory in PATH", file=sys.stderr)
+        sys.exit(1)
+
+    target = target_dir / "codexc"
+    try:
+        if target.exists() and source.samefile(target):
+            print(f"codexc is already installed at {target}")
+            return 0
+    except OSError:
+        pass
+    shutil.copy2(source, target)
+    target.chmod(target.stat().st_mode | 0o111)
+
+    path_set = {pathlib.Path(entry).expanduser() for entry in path_entries()}
+    print(f"Installed codexc to {target}")
+    if target_dir not in path_set:
+        print(f"Add this to your shell profile: export PATH=\"{target_dir}:$PATH\"")
+    return 0
+
+
+def parse_seconds(value, flag_name):
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        print(f"codexc: invalid {flag_name} value: {value!r}", file=sys.stderr)
+        sys.exit(2)
+    if seconds < 0:
+        print(f"codexc: {flag_name} must be >= 0", file=sys.stderr)
+        sys.exit(2)
+    return seconds
+
+
+class Screen:
+    def __init__(self, rows, cols):
+        self.rows = max(2, rows)
+        self.cols = max(20, cols)
+        self.grid = [[" "] * self.cols for _ in range(self.rows)]
+        self.row = 0
+        self.col = 0
+        self.scroll_top = 0
+        self.scroll_bottom = self.rows - 1
+        self.state = "ground"
+        self.csi = ""
+        self.osc_escape = False
+
+    def resize(self, rows, cols):
+        rows = max(2, rows)
+        cols = max(20, cols)
+        new_grid = [[" "] * cols for _ in range(rows)]
+        for row in range(min(self.rows, rows)):
+            for col in range(min(self.cols, cols)):
+                new_grid[row][col] = self.grid[row][col]
+        self.rows = rows
+        self.cols = cols
+        self.grid = new_grid
+        self.row = min(self.row, self.rows - 1)
+        self.col = min(self.col, self.cols - 1)
+        self.scroll_top = 0
+        self.scroll_bottom = self.rows - 1
+
+    def _clamp_cursor(self):
+        self.row = max(0, min(self.row, self.rows - 1))
+        self.col = max(0, min(self.col, self.cols - 1))
+
+    def _blank_line(self):
+        return [" "] * self.cols
+
+    def _scroll_up(self, top=None, bottom=None, count=1):
+        top = self.scroll_top if top is None else top
+        bottom = self.scroll_bottom if bottom is None else bottom
+        for _ in range(max(1, count)):
+            for row in range(top, bottom):
+                self.grid[row] = list(self.grid[row + 1])
+            self.grid[bottom] = self._blank_line()
+
+    def _scroll_down(self, top=None, bottom=None, count=1):
+        top = self.scroll_top if top is None else top
+        bottom = self.scroll_bottom if bottom is None else bottom
+        for _ in range(max(1, count)):
+            for row in range(bottom, top, -1):
+                self.grid[row] = list(self.grid[row - 1])
+            self.grid[top] = self._blank_line()
+
+    def _linefeed(self):
+        if self.row == self.scroll_bottom:
+            self._scroll_up()
+        else:
+            self.row += 1
+        self._clamp_cursor()
+
+    def _newline(self):
+        self._linefeed()
+
+    def _put_char(self, char):
+        if not char:
+            return
+        if self.col >= self.cols:
+            self.col = 0
+            self._linefeed()
+        self.grid[self.row][self.col] = char
+        self.col += 1
+        if self.col >= self.cols:
+            self.col = 0
+            self._linefeed()
+
+    def _erase_display(self, mode):
+        if mode == 2:
+            for row in range(self.rows):
+                self.grid[row] = self._blank_line()
+            self.row = 0
+            self.col = 0
+            return
+        if mode == 1:
+            for row in range(self.row):
+                self.grid[row] = self._blank_line()
+            for col in range(self.col + 1):
+                self.grid[self.row][col] = " "
+            return
+        for col in range(self.col, self.cols):
+            self.grid[self.row][col] = " "
+        for row in range(self.row + 1, self.rows):
+            self.grid[row] = self._blank_line()
+
+    def _erase_line(self, mode):
+        if mode == 2:
+            self.grid[self.row] = self._blank_line()
+            return
+        if mode == 1:
+            for col in range(self.col + 1):
+                self.grid[self.row][col] = " "
+            return
+        for col in range(self.col, self.cols):
+            self.grid[self.row][col] = " "
+
+    def _handle_csi(self, sequence):
+        final = sequence[-1]
+        raw_params = sequence[:-1]
+        private = raw_params[:1] if raw_params[:1] in {"?", ">"} else ""
+        if private:
+            raw_params = raw_params[1:]
+        params = []
+        if raw_params:
+            for part in raw_params.split(";"):
+                if part == "":
+                    params.append(0)
+                else:
+                    try:
+                        params.append(int(part))
+                    except ValueError:
+                        params.append(0)
+        def get_param(position, default):
+            if position < len(params) and params[position] != 0:
+                return params[position]
+            return default
+        if final in {"h", "l", "m", "n", "u", "s", "t", "q", "c"}:
+            return
+        if final in {"H", "f"}:
+            self.row = get_param(0, 1) - 1
+            self.col = get_param(1, 1) - 1
+            self._clamp_cursor()
+            return
+        if final == "A":
+            self.row -= get_param(0, 1)
+            self._clamp_cursor()
+            return
+        if final == "B":
+            self.row += get_param(0, 1)
+            self._clamp_cursor()
+            return
+        if final == "C":
+            self.col += get_param(0, 1)
+            self._clamp_cursor()
+            return
+        if final == "D":
+            self.col -= get_param(0, 1)
+            self._clamp_cursor()
+            return
+        if final == "G":
+            self.col = get_param(0, 1) - 1
+            self._clamp_cursor()
+            return
+        if final == "d":
+            self.row = get_param(0, 1) - 1
+            self._clamp_cursor()
+            return
+        if final == "J":
+            self._erase_display(get_param(0, 0))
+            return
+        if final == "K":
+            self._erase_line(get_param(0, 0))
+            return
+        if final == "r":
+            top = get_param(0, 1) - 1
+            bottom = get_param(1, self.rows) - 1
+            if 0 <= top < bottom < self.rows:
+                self.scroll_top = top
+                self.scroll_bottom = bottom
+            else:
+                self.scroll_top = 0
+                self.scroll_bottom = self.rows - 1
+            self.row = self.scroll_top
+            self.col = 0
+            return
+        if final == "M":
+            count = get_param(0, 1)
+            if self.row == self.scroll_top:
+                self._scroll_down(count=count)
+            else:
+                self.row = max(self.scroll_top, self.row - count)
+            self._clamp_cursor()
+            return
+        if final == "L":
+            self._scroll_down(top=self.row, bottom=self.scroll_bottom, count=get_param(0, 1))
+            return
+        if final == "S":
+            self._scroll_up(count=get_param(0, 1))
+            return
+        if final == "T":
+            self._scroll_down(count=get_param(0, 1))
+            return
+
+    def feed(self, data):
+        for char in data:
+            if self.state == "ground":
+                if char == "\x1b":
+                    self.state = "esc"
+                elif char == "\r":
+                    self.col = 0
+                elif char == "\n":
+                    self._newline()
+                elif char == "\b":
+                    self.col = max(0, self.col - 1)
+                elif char == "\t":
+                    next_tab = ((self.col // 8) + 1) * 8
+                    self.col = min(self.cols - 1, next_tab)
+                elif ord(char) >= 32:
+                    self._put_char(char)
+            elif self.state == "esc":
+                if char == "[":
+                    self.state = "csi"
+                    self.csi = ""
+                elif char == "]":
+                    self.state = "osc"
+                    self.osc_escape = False
+                else:
+                    self.state = "ground"
+            elif self.state == "csi":
+                self.csi += char
+                if "@" <= char <= "~":
+                    self._handle_csi(self.csi)
+                    self.csi = ""
+                    self.state = "ground"
+            elif self.state == "osc":
+                if char == "\x07":
+                    self.state = "ground"
+                    self.osc_escape = False
+                elif self.osc_escape and char == "\\":
+                    self.state = "ground"
+                    self.osc_escape = False
+                else:
+                    self.osc_escape = (char == "\x1b")
+
+    def text(self):
+        lines = ["".join(row).rstrip() for row in self.grid]
+        return "\n".join(line for line in lines if line)
+
+
+def debug_log(enabled, message):
+    if enabled:
+        print(f"[codexc] {message}", file=sys.stderr, flush=True)
+
+
+def get_terminal_size():
+    size = shutil.get_terminal_size((120, 40))
+    return size.lines, size.columns
+
+
+def apply_winsize(fd, rows, cols):
+    packed = struct.pack("HHHH", rows, cols, 0, 0)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
+
+
+def screen_mode(screen_text):
+    lines = [line.strip().lower() for line in screen_text.splitlines() if line.strip()]
+    text = "\n".join(lines[-8:])
+    working_markers = (
+        "esc to interrupt",
+        "working",
+        "starting mcp servers",
+        "thinking",
+    )
+    ready_markers = (
+        "use /skills to list available skills",
+        "tab to queue message",
+        "? for shortcuts",
+    )
+    working_pos = max((text.rfind(marker) for marker in working_markers), default=-1)
+    ready_pos = max((text.rfind(marker) for marker in ready_markers), default=-1)
+    if working_pos > ready_pos:
+        return "working"
+    if ready_pos > working_pos:
+        return "ready"
+    if working_pos != -1:
+        return "working"
+    if ready_pos != -1:
+        return "ready"
+    return "other"
+
+
+def main():
+    codex_args, extra_prompts, install, install_dir, idle_timeout_override = parse_args(sys.argv[1:])
+    continue_prompt = build_continue_prompt(extra_prompts)
+    ready_delay = float(os.environ.get("CODEXC_READY_DELAY", os.environ.get("CODEXC_AUTO_DELAY", "1.5")))
+    idle_timeout_value = idle_timeout_override if idle_timeout_override is not None else os.environ.get("CODEXC_IDLE_TIMEOUT", "60.0")
+    idle_timeout = parse_seconds(idle_timeout_value, "--idle-timeout")
+    max_autocontinues = int(os.environ.get("CODEXC_MAX_AUTOCONTINUES", "0"))
+    debug = env_flag("CODEXC_DEBUG")
+    codex_bin = os.environ.get("CODEXC_CODEX_BIN", "codex")
+    tty_fd = open_controlling_tty()
+
+    if install:
+        sys.exit(install_self(install_dir))
+
+    print(BANNER, flush=True)
+    print(f"Auto-continue after {idle_timeout:g}s of no human input", flush=True)
+
+    if tty_fd is None or not sys.stdout.isatty():
+        exec_passthrough(codex_bin, codex_args)
+
+    rows, cols = get_terminal_size()
+    screen = Screen(rows, cols)
+    master_fd, slave_fd = os.openpty()
+    apply_winsize(slave_fd, rows, cols)
+
+    def child_preexec():
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+    child = subprocess.Popen(
+        [codex_bin, *codex_args],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+        preexec_fn=child_preexec,
+    )
+    os.close(slave_fd)
+    os.set_blocking(master_fd, False)
+
+    old_tty = termios.tcgetattr(tty_fd)
+    tty.setraw(tty_fd)
+
+    state = {
+        "mode": "other",
+        "waiting_for_next_ready": False,
+        "ready_since": None,
+        "autocontinue_count": 0,
+        "stdin_closed": False,
+        "last_human_input_at": time.monotonic(),
+    }
+
+    def cleanup():
+        try:
+            termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_tty)
+        except termios.error:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        try:
+            os.close(tty_fd)
+        except OSError:
+            pass
+
+    def on_winch(signum, frame):
+        del signum, frame
+        new_rows, new_cols = get_terminal_size()
+        screen.resize(new_rows, new_cols)
+        try:
+            apply_winsize(master_fd, new_rows, new_cols)
+        except OSError:
+            return
+
+    signal.signal(signal.SIGWINCH, on_winch)
+
+    try:
+        while True:
+            if child.poll() is not None:
+                break
+
+            timeout = 0.1
+
+            watch_fds = [master_fd]
+            if not state["stdin_closed"]:
+                watch_fds.append(tty_fd)
+            read_ready, _, _ = select.select(watch_fds, [], [], timeout)
+
+            if master_fd in read_ready:
+                try:
+                    chunk = os.read(master_fd, 65536)
+                except BlockingIOError:
+                    chunk = b""
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        chunk = b""
+                    else:
+                        raise
+                if not chunk:
+                    break
+                os.write(sys.stdout.fileno(), chunk)
+                sys.stdout.flush()
+                decoded = chunk.decode("utf-8", errors="ignore")
+                screen.feed(decoded)
+                mode = screen_mode(screen.text())
+                if mode != state["mode"]:
+                    debug_log(debug, f"screen mode {state['mode']} -> {mode}")
+                    state["mode"] = mode
+                if mode == "working":
+                    state["waiting_for_next_ready"] = True
+                    state["ready_since"] = None
+                elif mode == "ready" and state["waiting_for_next_ready"]:
+                    if state["ready_since"] is None:
+                        state["ready_since"] = time.monotonic()
+                        debug_log(debug, "ready detected, waiting for idle/autopilot window")
+                else:
+                    state["ready_since"] = None
+
+            if tty_fd in read_ready:
+                try:
+                    user_bytes = os.read(tty_fd, 65536)
+                except BlockingIOError:
+                    user_bytes = b""
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        user_bytes = b""
+                    else:
+                        raise
+                if not user_bytes:
+                    state["stdin_closed"] = True
+                    continue
+                if not CONTROL_REPLY_RE.fullmatch(user_bytes):
+                    state["last_human_input_at"] = time.monotonic()
+                    debug_log(debug, "manual input detected, resetting idle timer")
+                    state["waiting_for_next_ready"] = False
+                    state["ready_since"] = None
+                os.write(master_fd, user_bytes)
+
+            now = time.monotonic()
+            autopilot_active = now - state["last_human_input_at"] >= idle_timeout
+            if (
+                autopilot_active
+                and state["waiting_for_next_ready"]
+                and state["ready_since"] is not None
+                and now >= state["ready_since"] + ready_delay
+                and child.poll() is None
+                and (max_autocontinues == 0 or state["autocontinue_count"] < max_autocontinues)
+            ):
+                payload = continue_prompt + "\n"
+                debug_log(debug, f"auto-continue #{state['autocontinue_count'] + 1}")
+                os.write(master_fd, payload.encode("utf-8"))
+                state["waiting_for_next_ready"] = False
+                state["ready_since"] = None
+                state["autocontinue_count"] += 1
+    finally:
+        cleanup()
+
+    if child.returncode is None:
+        child.wait()
+    sys.exit(child.returncode)
+
+
+if __name__ == "__main__":
+    main()
+PY
