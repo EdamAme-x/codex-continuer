@@ -433,7 +433,8 @@ def apply_winsize(fd, rows, cols):
 
 def screen_mode(screen_text):
     lines = [line.strip().lower() for line in screen_text.splitlines() if line.strip()]
-    text = "\n".join(lines[-8:])
+    recent_lines = lines[-8:]
+    text = "\n".join(recent_lines)
     working_markers = (
         "esc to interrupt",
         "working",
@@ -445,6 +446,13 @@ def screen_mode(screen_text):
         "tab to queue message",
         "? for shortcuts",
     )
+    has_prompt_line = any(line.startswith("›") or line.startswith(">") for line in recent_lines)
+    has_footer_line = any(
+        ("context left" in line)
+        or re.search(r"\b\d+% left\b", line)
+        or ("gpt-" in line and "left" in line)
+        for line in recent_lines
+    )
     working_pos = max((text.rfind(marker) for marker in working_markers), default=-1)
     ready_pos = max((text.rfind(marker) for marker in ready_markers), default=-1)
     if working_pos > ready_pos:
@@ -454,6 +462,8 @@ def screen_mode(screen_text):
     if working_pos != -1:
         return "working"
     if ready_pos != -1:
+        return "ready"
+    if has_prompt_line and has_footer_line:
         return "ready"
     return "other"
 
