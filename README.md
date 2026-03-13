@@ -52,6 +52,7 @@ The built-in continuation message tells Codex to:
 ```bash
 CODEXC_IDLE_TIMEOUT=60          # seconds of no human input before autopilot starts
 CODEXC_READY_DELAY=1.5          # prompt-stability delay before an auto-send
+CODEXC_SUBMIT_DELAY=0.25        # wait after typing before pressing Enter
 CODEXC_AUTO_DELAY=1.5           # legacy alias for CODEXC_READY_DELAY
 CODEXC_MAX_AUTOCONTINUES=0      # 0 = unlimited
 CODEXC_CONTINUE_PROMPT="..."    # replace the default continuation prompt
