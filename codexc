@@ -617,9 +617,10 @@ def main():
                 and child.poll() is None
                 and (max_autocontinues == 0 or state["autocontinue_count"] < max_autocontinues)
             ):
-                payload = continue_prompt + "\n"
+                payload = continue_prompt
                 debug_log(debug, f"auto-continue #{state['autocontinue_count'] + 1}")
                 os.write(master_fd, payload.encode("utf-8"))
+                os.write(master_fd, b"\r")
                 state["waiting_for_next_ready"] = False
                 state["ready_since"] = None
                 state["autocontinue_count"] += 1
